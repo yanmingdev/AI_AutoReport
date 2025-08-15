@@ -1,0 +1,17 @@
+【結案報告範本】
+專案名稱：{title}
+
+一、作業目標
+{goal}
+
+二、作業效益
+{benefit}
+
+三、作業流程
+{process}
+
+四、作業時程
+{schedule}
+
+五、分工與責任
+{assignment}
