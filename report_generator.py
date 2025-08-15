@@ -1,441 +1,467 @@
 # =============================================================================
 # report_generator.py
 # -----------------------------------------------------------------------------
-# Streamlit「需求/結案報告 AI 產生器」— Cloud-ready（*.streamlit.app）
-# - 相對路徑載入 templates/
-# - 金鑰：st.secrets["GEMINI_API_KEY"] 優先，否則退回 .env
-# - 下載檔名：優先用側欄「專案名稱」；其次由 AI 內容解析；最後用時間戳
-# - Sidebar 寬度可調（預設 360px）
-# - PPT 依章節自動分頁：支援 **粗體章節**、數字/中文數字編號、Markdown # 標題
+# 調整重點（其餘邏輯與變數名稱維持不變）：
+# 1) 移除本機硬路徑 D:/AI_AutoReport，改用相對路徑 BASE_DIR。
+# 2) GEMINI_API_KEY：優先 st.secrets，其次再讀 .env（本機開發用）。
+# 3) 模板路徑：優先讀 BASE_DIR / "templates" / <檔名>，若無再回退到專案根目錄。
+# 4) Logging：寫到 BASE_DIR/logs；若檔案寫入失敗則僅用 StreamHandler。
+# 5) Sidebar 寬度調整為 360px（其餘 CSS 與 UI 不變）。
 # =============================================================================
 
-from __future__ import annotations
-
-import io
 import os
+import io
 import re
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Tuple
 
-import streamlit as st
 from dotenv import load_dotenv
-
-# Google Generative AI（新版 SDK）
+import streamlit as st
+import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
-
-# 檔案輸出
 from pptx import Presentation
 from pptx.util import Pt
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 
-# -----------------------------------------------------------------------------
-# 0) 基本設定
-# -----------------------------------------------------------------------------
 
-BASE_DIR = Path(__file__).parent.resolve()   # 專案根目錄
-SIDEBAR_WIDTH_PX = 360                       # 側邊欄寬度（可改 320~420）
+# =============================================================================
+# 0. 基底路徑
+# =============================================================================
+BASE_DIR = Path(__file__).parent.resolve()
 
-# Logging（Cloud 檔案系統為暫存）
-log_dir = BASE_DIR / "logs"
-log_dir.mkdir(exist_ok=True, parents=True)
-log_path = log_dir / f"log_{datetime.now():%m%d}.log"
+
+# =============================================================================
+# 1. Logging 設定（改成相對路徑，且容錯）
+# =============================================================================
+log_dir = str(BASE_DIR / "logs")
+os.makedirs(log_dir, exist_ok=True)
+today = datetime.now().strftime("%m%d")
+log_file = os.path.join(log_dir, f"log_{today}.log")
+
+handlers = [logging.StreamHandler()]
+try:
+    handlers.insert(0, logging.FileHandler(log_file, encoding="utf-8"))
+except Exception:
+    # 在某些無法寫檔的雲端環境，容錯只用 console
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(log_path, encoding="utf-8"), logging.StreamHandler()],
+    handlers=handlers
 )
 logger = logging.getLogger(__name__)
-logger.info("=== App start ===")
+logger.info("=== Application start ===")
 
-# -----------------------------------------------------------------------------
-# 1) 讀取金鑰：st.secrets 優先，其次 .env
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Gemini 文件產生器", page_icon="✨", layout="wide")
 
-load_dotenv(BASE_DIR / ".env")  # 本機開發可用
-API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-if not API_KEY:
+# =============================================================================
+# 2. 讀取 Gemini API Key（優先 secrets，再退回 .env）
+# =============================================================================
+load_dotenv(BASE_DIR / ".env")  # 本機開發可用；Cloud 主要讀 secrets
+api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+if not api_key:
     st.error("❌ 找不到 GEMINI_API_KEY，請在 Streamlit Secrets（或本機 .env）設定")
     st.stop()
 
-# -----------------------------------------------------------------------------
-# 2) 基礎樣式（加寬 Sidebar + 主色）
-# -----------------------------------------------------------------------------
-st.markdown(
-    f"""
-<style>
-/* === 側邊欄加寬 === */
-[data-testid="stSidebar"] {{
-  width: {SIDEBAR_WIDTH_PX}px !important;
-  min-width: {SIDEBAR_WIDTH_PX}px !important;
-  max-width: {SIDEBAR_WIDTH_PX}px !important;
-}}
-/* multiselect 已選標籤可換行 */
-[data-testid="stSidebar"] [data-baseweb="select"] div[role="combobox"] {{
-  flex-wrap: wrap;
-}}
-/* 常用字級/行距調整 */
-.block-title {{ font-size: 20px; margin: 8px 0 6px; }}
-.stTextArea textarea {{ height: 200px !important; }}
-</style>
-""",
-    unsafe_allow_html=True,
+
+# =============================================================================
+# 3. Streamlit 頁面設定
+# =============================================================================
+st.set_page_config(
+    page_title="Gemini 文件產生器",
+    page_icon="✨",
+    layout="wide"
 )
 
-# -----------------------------------------------------------------------------
-# 3) UI：Sidebar（報告類型、欄位、溫度）
-# -----------------------------------------------------------------------------
-st.sidebar.markdown("**生成報告格式：**")
-doc_type = st.sidebar.selectbox("", ["結案報告", "需求文件"], index=0, label_visibility="collapsed")
 
-st.sidebar.markdown("**選擇要生成的內容區塊：**")
-BLOCKS = ["專案名稱", "專案目標", "專案效益", "開發流程", "作業時程", "專案分工"]
-selected_blocks = st.sidebar.multiselect("區塊", BLOCKS, default=[], label_visibility="collapsed")
-
-st.sidebar.markdown("**創意溫度**（0.0＝保守 ↔ 1.0＝創意）")
-temperature = st.sidebar.slider("", 0.0, 1.0, 0.50, 0.05)
-
-# 依類型決定主色（再注入樣式）
-PRIMARY = "#FF8C00" if doc_type == "結案報告" else "#1E90FF"
-PRIMARY_LIGHT = "#FF8C0333" if doc_type == "結案報告" else "#1E90FF33"
-st.markdown(
-    f"""
+# =============================================================================
+# 4. 全域 CSS 設定（僅把側欄寬度從 200px 調寬，其餘維持）
+# =============================================================================
+st.markdown(f"""
 <style>
 :root {{
-  --primary: {PRIMARY};
-  --primary-light: {PRIMARY_LIGHT};
+    --primary-color: {("#FF8C00" if st.session_state.get('doc_type', '結案報告') == "結案報告" else "#1E90FF")};
+    --primary-light: {("#FF8C0333" if st.session_state.get('doc_type', '結案報告') == "結案報告" else "#1E90FF33")};
 }}
-.stButton>button {{ background-color: var(--primary) !important; color: #fff !important; border: none !important; }}
-.rc-slider-rail {{ background: var(--primary-light) !important; }}
-.rc-slider-track, .rc-slider-handle {{ background: var(--primary) !important; border-color: var(--primary) !important; }}
-[data-testid="stSidebar"] [data-baseweb="tag"] {{ background: var(--primary) !important; }}
+.stButton>button {{
+    background-color: var(--primary-color)!important;
+    color: #fff!important;
+    border: none!important;
+}}
+[data-testid="stSidebar"] [data-baseweb="tag"] {{
+    background-color: var(--primary-color)!important;
+}}
 [data-testid="stSidebar"] [data-baseweb="tag"] span,
-[data-testid="stSidebar"] [data-baseweb="tag"] svg {{ color: #fff !important; }}
+[data-testid="stSidebar"] [data-baseweb="tag"] svg,
+[data-testid="stSidebar"] [data-baseweb="tag-close-button"] {{
+    color: #fff!important;
+}}
+/* Slider 樣式 */
+.rc-slider-rail {{
+    background-color: var(--primary-light)!important;
+}}
+.rc-slider-track {{
+    background-color: var(--primary-color)!important;
+}}
+.rc-slider-handle {{
+    background-color: var(--primary-color)!important;
+    border-color: var(--primary-color)!important;
+}}
+.rc-slider-tooltip-inner {{
+    background-color: var(--primary-color)!important;
+    border: 1px solid var(--primary-color)!important;
+    color: #fff!important;
+}}
+.rc-slider-handle::after {{
+    color: #fff!important;
+}}
+.header {{
+    margin-top:-2.4rem!important; margin-bottom:0!important; padding:0!important;
+}}
+.big-title {{
+    font-size:28px!important; font-weight:800!important; margin:0;
+}}
+.subtitle {{
+    font-size:16px!important; color:#ddd!important; margin:0;
+}}
+/* —— 這一行把原本 200px 調寬到 360px —— */
+section[data-testid="stSidebar"] {{
+    width:360px!important;
+}}
+.block-title {{
+    font-size:20px!important; margin-top:1rem!important; margin-bottom:0.3rem!important;
+}}
+.stTextArea textarea {{
+    height:200px!important;
+}}
+[data-testid="stMarkdownContainer"] h2 {{
+    color:inherit!important;
+}}
 </style>
-""",
-    unsafe_allow_html=True,
+""", unsafe_allow_html=True)
+
+
+# =============================================================================
+# 5. Sidebar UI 控件（報告類型、欄位選擇、溫度）— 完全保留原本邏輯
+# =============================================================================
+st.sidebar.markdown('<p>生成報告格式：</p>', unsafe_allow_html=True)
+doc_type = st.sidebar.selectbox(
+    "",
+    ["結案報告", "需求文件"],
+    index=0,
+    label_visibility="collapsed"
+)
+st.session_state["doc_type"] = doc_type  # 記錄主題色用
+
+st.sidebar.markdown('<p>選擇要生成的內容區塊：</p>', unsafe_allow_html=True)
+available_blocks = [
+    "專案名稱", "專案目標", "專案效益",
+    "開發流程", "作業時程", "專案分工"
+]
+selected_blocks = st.sidebar.multiselect(
+    "區塊", available_blocks, default=[], label_visibility="collapsed"
 )
 
-# -----------------------------------------------------------------------------
-# 4) Header
-# -----------------------------------------------------------------------------
-st.markdown(
-    f"""
-<div style="margin-top:-2rem">
-  <h1 style="margin:0">🚀 Gemini {doc_type} 產生器</h1>
-  <p style="color:#bbb;margin:.25rem 0 0 0">輸入口語化內容，AI 產出專業 {doc_type}（可下載 Word / PPT）</p>
+st.sidebar.markdown('<p>創意溫度<br>(0.0＝保守 ↔ 1.0＝創意)</p>', unsafe_allow_html=True)
+creativity_temp = st.sidebar.slider("", 0.0, 1.0, 0.5, 0.1)
+
+
+# =============================================================================
+# 6. 頁面主標題區（不變）
+# =============================================================================
+st.markdown(f"""
+<div class="header">
+  <div class="big-title">🚀 Gemini {doc_type} 產生器</div>
+  <div class="subtitle">只要簡單輸入口語化內容，AI 幫你生成專業 {doc_type}！</div>
 </div>
-""",
-    unsafe_allow_html=True,
-)
-st.write("---")
+""", unsafe_allow_html=True)
 
-# -----------------------------------------------------------------------------
-# 5) 載入模板（相對路徑）
-# -----------------------------------------------------------------------------
-def load_template(doc_type: str) -> str:
-    """讀取 templates/ 下的模板文字。"""
-    name = "prompt_template.txt" if doc_type == "結案報告" else "requirement_template.txt"
-    path = BASE_DIR / "templates" / name
-    if not path.exists():
-        st.error(f"❌ 找不到範本：{path}")
-        st.stop()
-    return path.read_text(encoding="utf-8")
 
-# -----------------------------------------------------------------------------
-# 6) 呼叫 Gemini 產生內容
-# -----------------------------------------------------------------------------
-def generate_content(*, title: str, goal: str, benefit: str,
-                     process: str, schedule: str, assignment: str) -> str:
-    """用模板組合 Prompt，呼叫 Gemini 產生文字內容。"""
-    prompt = load_template(doc_type).format(
-        title=title,
-        goal=goal,
-        benefit=benefit,
-        process=process,
-        schedule=schedule,
-        assignment=assignment,
+# =============================================================================
+# 7. 載入 Prompt 模板（改成相對路徑，行為等同）
+# =============================================================================
+def load_template(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+# =============================================================================
+# 8. 呼叫 Gemini 生成內容（僅改模板路徑的來源，函式簽名與內文維持）
+# =============================================================================
+def generate_content(
+    project_title: str,
+    project_objective: str,
+    project_benefit: str,
+    development_process: str,
+    timeline_schedule: str,
+    project_assignment: str
+) -> str:
+    template_file = (
+        "prompt_template.txt"
+        if doc_type == "結案報告"
+        else "requirement_template.txt"
     )
-    client = genai.Client(api_key=API_KEY)
-    cfg = types.GenerateContentConfig(temperature=temperature)
-    resp = client.models.generate_content(model="gemini-1.5-flash", contents=[prompt], config=cfg)
-    return resp.text or ""
 
-# -----------------------------------------------------------------------------
-# 7) 動態輸入欄
-# -----------------------------------------------------------------------------
-LABELS = {
+    # 先找 templates/<檔案>，若沒有則回退到專案根目錄（與你本地相容）
+    tpl_path = BASE_DIR / "templates" / template_file
+    if not tpl_path.exists():
+        tpl_path = BASE_DIR / template_file
+
+    if not tpl_path.exists():
+        st.error(f"找不到範本：{tpl_path}")
+        st.stop()
+
+    prompt = load_template(str(tpl_path)).format(
+        title=project_title,
+        goal=project_objective,
+        benefit=project_benefit,
+        process=development_process,
+        schedule=timeline_schedule,
+        assignment=project_assignment
+    )
+
+    client = genai.Client(api_key=api_key)
+    cfg = types.GenerateContentConfig(temperature=creativity_temp)
+    resp = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=[prompt],
+        config=cfg
+    )
+    return resp.text
+
+
+# =============================================================================
+# 9. 動態產生多欄輸入區（不變）
+# =============================================================================
+field_labels = {
     "專案名稱": "🧩 專案名稱",
     "專案目標": "🎯 專案目標",
     "專案效益": "✨ 專案效益",
     "開發流程": "🛠️ 開發流程",
     "作業時程": "⏳ 作業時程",
-    "專案分工": "👥 專案分工",
+    "專案分工": "👥 專案分工"
 }
-values: dict[str, str] = {}
-
+field_values = {}
 for i in range(0, len(selected_blocks), 3):
     cols = st.columns(3)
-    for j, block in enumerate(selected_blocks[i : i + 3]):
+    for j, block in enumerate(selected_blocks[i:i+3]):
         with cols[j]:
-            st.markdown(f"<div class='block-title'>{LABELS[block]}</div>", unsafe_allow_html=True)
-            values[block] = st.text_area(f"請填寫 {block}：", key=f"ta_{block}", label_visibility="collapsed")
+            st.markdown(
+                f"<div class='block-title'>{field_labels[block]}</div>",
+                unsafe_allow_html=True
+            )
+            field_values[block] = st.text_area(
+                f"請填寫 {block}：",
+                height=200,
+                label_visibility="collapsed"
+            )
 
-project_title       = values.get("專案名稱", "")
-project_goal        = values.get("專案目標", "")
-project_benefit     = values.get("專案效益", "")
-dev_process         = values.get("開發流程", "")
-timeline_schedule   = values.get("作業時程", "")
-project_assignment  = values.get("專案分工", "")
+project_title       = field_values.get("專案名稱", "")
+project_objective   = field_values.get("專案目標", "")
+project_benefit     = field_values.get("專案效益", "")
+development_process = field_values.get("開發流程", "")
+timeline_schedule   = field_values.get("作業時程", "")
+project_assignment  = field_values.get("專案分工", "")
 
-st.write("")
+st.write("---")
 
-# -----------------------------------------------------------------------------
-# 8) 標題解析 + 檔名決策
-# -----------------------------------------------------------------------------
-def sanitize_filename(name: str) -> str:
-    """Windows/Unix 不允許的字元改為底線；去頭尾空白與底線。"""
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    return name.strip("_ ").strip()
 
-def extract_title_from_numbered(text: str) -> Optional[str]:
-    """舊模板：『一、專案名稱』後一行的內容。"""
-    pats = [
-        r"一、專案名稱[^\n\r]*\n\s*[-＊*]\s*(.+)",
-        r"一、專案名稱[^\n\r]*\n\s*(.+)",
+# =============================================================================
+# 10. 提取專案名稱（給檔案命名用）— 完全保留原本邏輯
+# =============================================================================
+def extract_project_title(text):
+    patterns = [
+        r"一、專案名稱[^\n\r]*\n\s*[-＊*]\s*(.+)",   # markdown/列點
+        r"一、專案名稱[^\n\r]*\n\s*(.+)",            # 純文字
     ]
-    for pat in pats:
-        m = re.search(pat, text)
-        if m:
-            return m.group(1).strip()
+    for pat in patterns:
+        match = re.search(pat, text)
+        if match:
+            title = match.group(1).strip()
+            title = re.sub(r'\s*\(.*?\)$', '', title)
+            return title
     return None
 
-def extract_title_from_colon(text: str) -> Optional[str]:
-    """『專案名稱：XXX』格式。"""
-    m = re.search(r"專案名稱[:：]\s*(.+)", text)
-    return m.group(1).strip() if m else None
 
-def extract_title_from_md(text: str) -> Optional[str]:
-    """Markdown H1：『# XXX 專案』。"""
-    m = re.search(r"^\s*#\s*(.+)$", text, re.M)
-    return m.group(1).strip() if m else None
-
-def decide_filename_base(user_title: str, generated: str, doc_type: str) -> str:
-    """
-    1) 優先用側欄『專案名稱』
-    2) 再從 AI 內容解析（多種格式）
-    3) 最後用 doc_type + 時間戳
-    """
-    if user_title.strip():
-        return sanitize_filename(user_title)
-    for fn in (extract_title_from_numbered, extract_title_from_colon, extract_title_from_md):
-        val = fn(generated)
-        if val:
-            return sanitize_filename(val)
-    return f"{doc_type}_{datetime.now():%Y%m%d_%H%M%S}"
-
-# -----------------------------------------------------------------------------
-# 9) 章節偵測：依標題切段（用於 PPT/Word 分頁）
-# -----------------------------------------------------------------------------
-HEADING_LINE = re.compile(
-    r"""^(?:
-        \s*#{1,6}\s*(?P<h_md>.+?)\s*$                                  # Markdown 標題
-        |
-        \s*\*\*\s*(?P<h_bold>.+?)\s*\*\*\s*$                           # 整行粗體 **章節**
-        |
-        \s*(?P<h_num>\d+|[一二三四五六七八九十]+)[\.\、]\s*(?P<h_txt>.+?)\s*$  # 1. / 一、 章節
-    )""",
-    re.X
-)
-
-def split_sections(text: str) -> List[Tuple[str, str]]:
-    """
-    依『章節標題行』將全文切成多段。
-    支援：
-      - Markdown 標題：# 標題
-      - 整行粗體：**1. 標題**、**需求目標**
-      - 數字/中文數字編號：1. 標題 / 一、標題
-    回傳：[(title, body), ...]；若偵測不到章節，回傳空清單。
-    """
-    lines = text.splitlines()
-    sections: List[Tuple[str, List[str]]] = []
-    cur_title: Optional[str] = None
-    cur_buf: List[str] = []
-
-    def flush():
-        if cur_title is not None or cur_buf:
-            title = (cur_title or "").strip()
-            body = "\n".join(cur_buf).strip()
-            sections.append((title, body))
-
-    for line in lines:
-        m = HEADING_LINE.match(line)
-        if m:
-            # 碰到新章節 → 先收前一段
-            flush()
-            # 取出標題文字
-            title = m.group("h_md") or m.group("h_bold") or m.group("h_txt") or ""
-            cur_title = title.strip()
-            cur_buf = []
-        else:
-            cur_buf.append(line)
-
-    flush()  # 收尾
-
-    # 移除完全空的章節
-    result = [(t, b) for (t, b) in sections if (t or b)]
-    # 若只有一段而且沒有標題，視為「未偵測到章節」
-    if len(result) == 1 and not result[0][0]:
-        return []
-    return result
-
-# -----------------------------------------------------------------------------
-# 10) 生成按鈕
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 11. session_state: AI內容不消失
+# =============================================================================
 if "generated_text" not in st.session_state:
     st.session_state["generated_text"] = ""
 
+
+# =============================================================================
+# 12. 生成按鈕（AI生成&寫入session_state）— 保持原行為
+# =============================================================================
 if st.button(f"🪄 生成 {doc_type}", use_container_width=True):
     if not selected_blocks:
-        st.warning("請至少選擇一個內容區塊")
+        st.warning("請至少選擇一個區塊")
     else:
-        missing = [b for b in selected_blocks if not values.get(b, "").strip()]
+        missing = [b for b in selected_blocks if not field_values.get(b, "").strip()]
         if missing:
-            st.warning("⚠️ 尚未填寫：「" + "、".join(missing) + "」")
+            st.warning("⚠️ 尚未填寫：" + "、".join(missing))
         else:
-            with st.spinner("AI 撰寫中，請稍候…"):
+            with st.spinner("AI 撰寫中..."):
                 try:
-                    text = generate_content(
-                        title=project_title,
-                        goal=project_goal,
-                        benefit=project_benefit,
-                        process=dev_process,
-                        schedule=timeline_schedule,
-                        assignment=project_assignment,
+                    generated_text = generate_content(
+                        project_title,
+                        project_objective,
+                        project_benefit,
+                        development_process,
+                        timeline_schedule,
+                        project_assignment
                     )
-                    st.session_state["generated_text"] = text
                 except Exception as e:
-                    logger.exception("Generate error")
-                    st.error(f"❌ 產生內容失敗：{e}")
-                    st.session_state["generated_text"] = ""
+                    st.error(f"❌ 發生錯誤：{e}")
+                    generated_text = None
+            if generated_text:
+                st.session_state["generated_text"] = generated_text
 
-# -----------------------------------------------------------------------------
-# 11) 預覽 + 下載（Word / PPT）
-# -----------------------------------------------------------------------------
-output = st.session_state.get("generated_text", "")
-if output:
-    st.success(f"🎉 已完成 {doc_type} 內容！")
-    st.markdown("### 📌 預覽")
-    st.markdown(output)
 
-    # 章節切割（重點）
-    sections = split_sections(output)  # → [(title, body), ...]
-    filename_base = decide_filename_base(project_title, output, doc_type)
+# =============================================================================
+# 13. 顯示 AI 產生內容區（含 Copy 功能、下載）— 行為不變
+# =============================================================================
+if st.session_state.get("generated_text"):
+    st.success(f"🎉 {doc_type} 生成完成！")
+    st.markdown(f"### 📌 {doc_type} 預覽")
+    st.markdown(st.session_state["generated_text"])
+    st.code(st.session_state["generated_text"], language="markdown")
 
-    # ------------------ 下載：PPTX（依章節分頁） ------------------
-    try:
-        prs = Presentation()
+    # Copy-to-clipboard 小提示（原樣保留）
+    components.html("""
+<script>
+;(function(){
+  const bind = ()=>{
+    const btn = window.parent.document
+                   .querySelector('button[title="Copy to clipboard"]');
+    if(!btn||btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    const lbl = document.createElement('span');
+    lbl.id = 'copy-label';
+    lbl.innerText = '點擊複製';
+    lbl.style = 'margin-left:8px; color:var(--primary-color); font-size:16px; vertical-align:middle; top:8px; position:relative;';
+    btn.parentElement.appendChild(lbl);
+    btn.addEventListener('click', ()=>{ lbl.innerText = '已複製'; });
+  };
+  setInterval(bind,500);
+})();
+</script>""", height=0)
 
-        # 首頁
-        slide = prs.slides.add_slide(prs.slide_layouts[0])
-        slide.shapes.title.text = filename_base
-        if len(slide.placeholders) > 1:
-            slide.placeholders[1].text = ""
+    # 取專案名稱作為檔案名（保留原本嚴格條件）
+    filename_base = extract_project_title(st.session_state["generated_text"])
+    if not filename_base:
+        st.error("❌ 無法擷取『專案名稱』（請確認AI回應有『一、專案名稱』區塊），無法下載檔案")
+    else:
+        filename_base = re.sub(r'[\\/:*?"<>|]', '_', filename_base)
+        generated_text = st.session_state["generated_text"]
 
-        # 首頁標題樣式
-        title_tf = slide.shapes.title.text_frame
-        p = title_tf.paragraphs[0]
-        p.font.size = Pt(48)
-        p.font.bold = True
-        p.font.name = "微軟正黑體"
-        p.alignment = PP_ALIGN.CENTER
+        # --- 產生 PPTX 下載（原邏輯：以 Markdown # 作為分頁標題） ---
+        try:
+            ppt = Presentation()
 
-        def add_content_slide(title: str, body: str) -> None:
-            s = prs.slides.add_slide(prs.slide_layouts[1])
+            # 首頁大標題
+            title_slide_layout = ppt.slide_layouts[0]
+            slide = ppt.slides.add_slide(title_slide_layout)
+            slide.shapes.title.text = filename_base
+            if slide.placeholders and len(slide.placeholders) > 1:
+                slide.placeholders[1].text = ""
 
-            # 標題
-            tf = s.shapes.title.text_frame
-            tf.clear()
-            tf.margin_top = Pt(5)
-            tf.vertical_anchor = MSO_ANCHOR.TOP
+            title_shape = slide.shapes.title
+            title_shape.text_frame.paragraphs[0].font.size = Pt(48)
+            title_shape.text_frame.paragraphs[0].font.name = '微軟正黑體'
+            title_shape.text_frame.paragraphs[0].font.bold = True
+            title_shape.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
 
-            h = tf.paragraphs[0]
-            h.text = title
-            h.font.name = "微軟正黑體"
-            h.font.size = Pt(32)
-            h.font.color.rgb = RGBColor(0, 108, 184)
-            h.alignment = PP_ALIGN.LEFT
+            # 仍依原本邏輯：只用 Markdown 標題分段
+            headers = list(re.finditer(r'^(#+)\s*(.+)', generated_text, re.M))
 
-            # 內文（逐行）
-            body_tf = s.placeholders[1].text_frame
-            body_tf.clear()
-            body_tf.margin_top = Pt(5)
-            body_tf.vertical_anchor = MSO_ANCHOR.TOP
+            def add_slide(title, content):
+                slide = ppt.slides.add_slide(ppt.slide_layouts[1])
 
-            for line in (body or "").split("\n"):
-                para = body_tf.add_paragraph()
-                para.text = line
-                para.font.name = "微軟正黑體"
-                para.font.size = Pt(24)
-                para.alignment = PP_ALIGN.LEFT
+                # 標題
+                tf = slide.shapes.title.text_frame
+                tf.clear()
+                tf.margin_top      = Pt(5)
+                tf.vertical_anchor = MSO_ANCHOR.TOP
+                p  = tf.paragraphs[0]
+                p.text              = title
+                p.font.name         = '微軟正黑體'
+                p.font.size         = Pt(32)
+                p.font.color.rgb    = RGBColor(0,108,184)
+                p.alignment         = PP_ALIGN.LEFT
 
-        if sections:
-            for title, body in sections:
-                add_content_slide(title if title else filename_base, body)
-        else:
-            # 偵測不到章節時，整段放一頁
-            add_content_slide(filename_base, output)
+                # 內文
+                body = slide.placeholders[1].text_frame
+                body.clear()
+                body.margin_top      = Pt(5)
+                body.vertical_anchor = MSO_ANCHOR.TOP
+                for line in content.split('\n'):
+                    para = body.add_paragraph()
+                    para.text           = line
+                    para.font.name      = '微軟正黑體'
+                    para.font.size      = Pt(24)
+                    para.font.color.rgb = RGBColor(0,0,0)
+                    para.alignment      = PP_ALIGN.LEFT
+                try:
+                    body.fit_text(max_size=24)
+                except Exception:
+                    pass
 
-        ppt_buf = io.BytesIO()
-        prs.save(ppt_buf)
-        ppt_buf.seek(0)
+            if headers:
+                for idx, h in enumerate(headers):
+                    start = h.end()
+                    end = headers[idx+1].start() if idx+1 < len(headers) else len(generated_text)
+                    add_slide(h.group(2).strip(), generated_text[start:end].strip())
+            else:
+                add_slide(filename_base, generated_text)
 
-        st.download_button(
-            "📥 下載 PPT 檔",
-            data=ppt_buf,
-            file_name=f"{filename_base}.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            use_container_width=True,
-        )
-    except Exception as e:
-        logger.exception("PPT export error")
-        st.error(f"❌ 匯出 PPTX 失敗：{e}（請確認 requirements.txt 已含 python-pptx）")
+            buf = io.BytesIO()
+            ppt.save(buf)
+            buf.seek(0)
+            st.download_button(
+                label="📥 下載 PPT 檔",
+                data=buf,
+                file_name=f"{filename_base}.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True
+            )
+        except ImportError:
+            st.error("❌ 無法匯出 PPTX，請 pip install python-pptx")
 
-    # ------------------ 下載：DOCX（同樣依章節寫入） ------------------
-    try:
-        from docx import Document
-        from docx.shared import Pt as DocPt
+        # --- 產生 DOCX 下載（原邏輯：同樣依 Markdown 標題） ---
+        try:
+            from docx import Document
+            from docx.shared import Pt as DocPt
 
-        doc = Document()
-        doc.styles["Normal"].font.name = "微軟正黑體"
-        doc.styles["Normal"].font.size = DocPt(12)
+            doc = Document()
+            doc.styles['Normal'].font.name = '微軟正黑體'
+            doc.styles['Normal'].font.size = DocPt(12)
 
-        if sections:
-            for title, body in sections:
-                if title:
-                    doc.add_heading(title, level=2)
-                for ln in (body or "").split("\n"):
-                    if ln.strip():
-                        p = doc.add_paragraph(ln)
-                        p.style = doc.styles["Normal"]
-        else:
-            doc.add_paragraph(output)
+            if headers:
+                for idx, h in enumerate(headers):
+                    start = h.end()
+                    end = headers[idx+1].start() if idx+1 < len(headers) else len(generated_text)
+                    heading = h.group(2).strip()
+                    lines = generated_text[start:end].strip().split('\n')
+                    doc.add_heading(heading, level=2)
+                    for line in lines:
+                        if line.strip():
+                            p = doc.add_paragraph(line)
+                            p.style = doc.styles['Normal']
+            else:
+                doc.add_paragraph(generated_text)
 
-        doc_buf = io.BytesIO()
-        doc.save(doc_buf)
-        doc_buf.seek(0)
-
-        st.download_button(
-            "📥 下載 Word 檔",
-            data=doc_buf,
-            file_name=f"{filename_base}.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
-    except Exception as e:
-        logger.exception("DOCX export error")
-        st.error(f"❌ 匯出 Word 失敗：{e}（請確認 requirements.txt 已含 python-docx）")
+            doc_buf = io.BytesIO()
+            doc.save(doc_buf)
+            doc_buf.seek(0)
+            st.download_button(
+                label="📥 下載 Word 檔",
+                data=doc_buf,
+                file_name=f"{filename_base}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+        except ImportError:
+            st.error("❌ 無法匯出 Word，請 pip install python-docx")
