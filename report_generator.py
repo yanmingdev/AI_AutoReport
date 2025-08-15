@@ -129,7 +129,7 @@ st.markdown(f"""
 }}
 /* —— 這一行把原本 200px 調寬到 360px —— */
 section[data-testid="stSidebar"] {{
-    width:360px!important;
+    width:300px!important;
 }}
 .block-title {{
     font-size:20px!important; margin-top:1rem!important; margin-bottom:0.3rem!important;
