@@ -205,7 +205,7 @@ def generate_content(
     )
 
     # 先找 templates/<檔案>，若沒有則回退到專案根目錄（與你本地相容）
-    tpl_path = BASE_DIR / "templates" / template_file
+    tpl_path = BASE_DIR / template_file
     if not tpl_path.exists():
         tpl_path = BASE_DIR / template_file
 
