@@ -2,11 +2,9 @@
 # report_generator.py
 # -----------------------------------------------------------------------------
 # 調整重點（其餘邏輯與變數名稱維持不變）：
-# 1) 移除本機硬路徑 D:/AI_AutoReport，改用相對路徑 BASE_DIR。
-# 2) GEMINI_API_KEY：優先 st.secrets，其次再讀 .env（本機開發用）。
-# 3) 模板路徑：優先讀 BASE_DIR / "templates" / <檔名>，若無再回退到專案根目錄。
-# 4) Logging：寫到 BASE_DIR/logs；若檔案寫入失敗則僅用 StreamHandler。
-# 5) Sidebar 寬度調整為 360px（其餘 CSS 與 UI 不變）。
+# - 修正 API Key 讀取順序：先讀 .env 的 os.getenv，再 try st.secrets（避免本機無 secrets.toml 時崩潰）
+# - 新增「目標系統」選單，並把 domain_hint_display 注入到模板前置說明與 format 參數
+# - 其餘 UI/流程/下載命名與分頁行為不變
 # =============================================================================
 
 import os
@@ -26,15 +24,13 @@ from pptx.util import Pt
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 
-
 # =============================================================================
-# 0. 基底路徑
+# 0. 基底路徑（你的專案在 D:\AI_AutoReport）
 # =============================================================================
 BASE_DIR = Path(__file__).parent.resolve()
 
-
 # =============================================================================
-# 1. Logging 設定（改成相對路徑，且容錯）
+# 1. Logging 設定（相對路徑 + 容錯）
 # =============================================================================
 log_dir = str(BASE_DIR / "logs")
 os.makedirs(log_dir, exist_ok=True)
@@ -45,7 +41,6 @@ handlers = [logging.StreamHandler()]
 try:
     handlers.insert(0, logging.FileHandler(log_file, encoding="utf-8"))
 except Exception:
-    # 在某些無法寫檔的雲端環境，容錯只用 console
     pass
 
 logging.basicConfig(
@@ -56,16 +51,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info("=== Application start ===")
 
+# =============================================================================
+# 2. 讀取 Gemini API Key（先 .env，再 try secrets）
+# =============================================================================
+# 確保會讀到 D:\AI_AutoReport\.env
+load_dotenv(BASE_DIR / ".env")
 
-# =============================================================================
-# 2. 讀取 Gemini API Key（優先 secrets，再退回 .env）
-# =============================================================================
-load_dotenv(BASE_DIR / ".env")  # 本機開發可用；Cloud 主要讀 secrets
-api_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("GEMINI_API_KEY")  # 本機優先走 .env
 if not api_key:
-    st.error("❌ 找不到 GEMINI_API_KEY，請在 Streamlit Secrets（或本機 .env）設定")
-    st.stop()
+    try:
+        # 雲端或你真的建立了 secrets.toml 才會讀到；本機沒有也不會崩
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        api_key = None
 
+if not api_key:
+    st.error(
+        "❌ 找不到 GEMINI_API_KEY。\n\n"
+        "請在 D:\\AI_AutoReport\\.env 內加入：\nGEMINI_API_KEY=你的API金鑰\n\n"
+        "（或建立 .streamlit\\secrets.toml 後再放入相同鍵值）"
+    )
+    st.stop()
 
 # =============================================================================
 # 3. Streamlit 頁面設定
@@ -76,9 +82,8 @@ st.set_page_config(
     layout="wide"
 )
 
-
 # =============================================================================
-# 4. 全域 CSS 設定（僅把側欄寬度從 200px 調寬，其餘維持）
+# 4. 全域 CSS（維持你的樣式與側欄 260px）
 # =============================================================================
 st.markdown(f"""
 <style>
@@ -91,61 +96,28 @@ st.markdown(f"""
     color: #fff!important;
     border: none!important;
 }}
-[data-testid="stSidebar"] [data-baseweb="tag"] {{
-    background-color: var(--primary-color)!important;
-}}
+[data-testid="stSidebar"] [data-baseweb="tag"] {{ background-color: var(--primary-color)!important; }}
 [data-testid="stSidebar"] [data-baseweb="tag"] span,
 [data-testid="stSidebar"] [data-baseweb="tag"] svg,
-[data-testid="stSidebar"] [data-baseweb="tag-close-button"] {{
-    color: #fff!important;
-}}
-/* Slider 樣式 */
-.rc-slider-rail {{
-    background-color: var(--primary-light)!important;
-}}
-.rc-slider-track {{
-    background-color: var(--primary-color)!important;
-}}
-.rc-slider-handle {{
-    background-color: var(--primary-color)!important;
-    border-color: var(--primary-color)!important;
-}}
-.rc-slider-tooltip-inner {{
-    background-color: var(--primary-color)!important;
-    border: 1px solid var(--primary-color)!important;
-    color: #fff!important;
-}}
-.rc-slider-handle::after {{
-    color: #fff!important;
-}}
-.header {{
-    margin-top:-2.4rem!important; margin-bottom:0!important; padding:0!important;
-}}
-.big-title {{
-    font-size:28px!important; font-weight:800!important; margin:0;
-}}
-.subtitle {{
-    font-size:16px!important; color:#ddd!important; margin:0;
-}}
-/* —— 這一行把原本 200px 調寬到 360px —— */
-section[data-testid="stSidebar"] {{
-    width:260px!important;
-}}
-.block-title {{
-    font-size:20px!important; margin-top:1rem!important; margin-bottom:0.3rem!important;
-}}
-.stTextArea textarea {{
-    height:200px!important;
-}}
-[data-testid="stMarkdownContainer"] h2 {{
-    color:inherit!important;
-}}
+[data-testid="stSidebar"] [data-baseweb="tag-close-button"] {{ color: #fff!important; }}
+.rc-slider-rail {{ background-color: var(--primary-light)!important; }}
+.rc-slider-track {{ background-color: var(--primary-color)!important; }}
+.rc-slider-handle {{ background-color: var(--primary-color)!important; border-color: var(--primary-color)!important; }}
+.rc-slider-tooltip-inner {{ background-color: var(--primary-color)!important; border: 1px solid var(--primary-color)!important; color: #fff!important; }}
+.rc-slider-handle::after {{ color: #fff!important; }}
+.header {{ margin-top:-2.4rem!important; margin-bottom:0!important; padding:0!important; }}
+.big-title {{ font-size:28px!important; font-weight:800!important; margin:0; }}
+.subtitle {{ font-size:16px!important; color:#ddd!important; margin:0; }}
+section[data-testid="stSidebar"] {{ width:260px!important; }}
+.block-title {{ font-size:20px!important; margin-top:1rem!important; margin-bottom:0.3rem!important; }}
+.stTextArea textarea {{ height:200px!important; }}
+[data-testid="stMarkdownContainer"] h4 {{color: var(--primary-color) !important;}}
+
 </style>
 """, unsafe_allow_html=True)
 
-
 # =============================================================================
-# 5. Sidebar UI 控件（報告類型、欄位選擇、溫度）— 完全保留原本邏輯
+# 5. Sidebar（新增目標系統；其餘不變）
 # =============================================================================
 st.sidebar.markdown('<p>生成報告格式：</p>', unsafe_allow_html=True)
 doc_type = st.sidebar.selectbox(
@@ -154,23 +126,27 @@ doc_type = st.sidebar.selectbox(
     index=0,
     label_visibility="collapsed"
 )
-st.session_state["doc_type"] = doc_type  # 記錄主題色用
+st.session_state["doc_type"] = doc_type
+
+# ⭐ 目標系統
+st.sidebar.markdown('<p>目標系統：</p>', unsafe_allow_html=True)
+domain_options = ["Generic", "PLM", "SAP/ERP", "Salesforce", "HR", "B2B"]
+domain_hint_display = st.sidebar.selectbox(
+    "",
+    domain_options,
+    index=0,
+    label_visibility="collapsed"
+)
 
 st.sidebar.markdown('<p>選擇要生成的內容區塊：</p>', unsafe_allow_html=True)
-available_blocks = [
-    "專案名稱", "專案目標", "專案效益",
-    "開發流程", "作業時程", "專案分工"
-]
-selected_blocks = st.sidebar.multiselect(
-    "區塊", available_blocks, default=[], label_visibility="collapsed"
-)
+available_blocks = ["專案名稱", "專案目標", "專案效益", "開發流程", "作業時程", "專案分工"]
+selected_blocks = st.sidebar.multiselect("區塊", available_blocks, default=[], label_visibility="collapsed")
 
 st.sidebar.markdown('<p>創意溫度<br>(0.0＝保守 ↔ 1.0＝創意)</p>', unsafe_allow_html=True)
 creativity_temp = st.sidebar.slider("", 0.0, 1.0, 0.5, 0.1)
 
-
 # =============================================================================
-# 6. 頁面主標題區（不變）
+# 6. 主標題
 # =============================================================================
 st.markdown(f"""
 <div class="header">
@@ -179,16 +155,14 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-
 # =============================================================================
-# 7. 載入 Prompt 模板（改成相對路徑，行為等同）
+# 7. 載入模板
 # =============================================================================
 def load_template(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
 
-
 # =============================================================================
-# 8. 呼叫 Gemini 生成內容（僅改模板路徑的來源，函式簽名與內文維持）
+# 8. 呼叫 Gemini（把目標系統注入模板上方 + format 參數）
 # =============================================================================
 def generate_content(
     project_title: str,
@@ -196,31 +170,32 @@ def generate_content(
     project_benefit: str,
     development_process: str,
     timeline_schedule: str,
-    project_assignment: str
+    project_assignment: str,
+    domain_hint_display: str
 ) -> str:
-    template_file = (
-        "prompt_template.txt"
-        if doc_type == "結案報告"
-        else "requirement_template.txt"
-    )
-
-    # 先找 templates/<檔案>，若沒有則回退到專案根目錄（與你本地相容）
+    template_file = "prompt_template.txt" if doc_type == "結案報告" else "requirement_template.txt"
     tpl_path = BASE_DIR / template_file
-    if not tpl_path.exists():
-        tpl_path = BASE_DIR / template_file
-
     if not tpl_path.exists():
         st.error(f"找不到範本：{tpl_path}")
         st.stop()
 
-    prompt = load_template(str(tpl_path)).format(
+    # 輕量前置指示，並提供 domain_hint/domain_hint_display 兩鍵
+    domain_instructions = (
+        f"【目標系統：{domain_hint_display}】\n"
+        f"- 若為 Generic，請使用通用術語；若為 PLM／SAP/ERP／Salesforce／HR／B2B，請套用對應領域名詞、流程與 KPI。\n\n"
+    )
+
+    prompt_body = load_template(str(tpl_path)).format(
         title=project_title,
         goal=project_objective,
         benefit=project_benefit,
         process=development_process,
         schedule=timeline_schedule,
-        assignment=project_assignment
+        assignment=project_assignment,
+        domain_hint=domain_hint_display,
+        domain_hint_display=domain_hint_display
     )
+    prompt = domain_instructions + prompt_body
 
     client = genai.Client(api_key=api_key)
     cfg = types.GenerateContentConfig(temperature=creativity_temp)
@@ -231,9 +206,8 @@ def generate_content(
     )
     return resp.text
 
-
 # =============================================================================
-# 9. 動態產生多欄輸入區（不變）
+# 9. 動態輸入區
 # =============================================================================
 field_labels = {
     "專案名稱": "🧩 專案名稱",
@@ -248,15 +222,8 @@ for i in range(0, len(selected_blocks), 3):
     cols = st.columns(3)
     for j, block in enumerate(selected_blocks[i:i+3]):
         with cols[j]:
-            st.markdown(
-                f"<div class='block-title'>{field_labels[block]}</div>",
-                unsafe_allow_html=True
-            )
-            field_values[block] = st.text_area(
-                f"請填寫 {block}：",
-                height=200,
-                label_visibility="collapsed"
-            )
+            st.markdown(f"<div class='block-title'>{field_labels[block]}</div>", unsafe_allow_html=True)
+            field_values[block] = st.text_area(f"請填寫 {block}：", height=200, label_visibility="collapsed")
 
 project_title       = field_values.get("專案名稱", "")
 project_objective   = field_values.get("專案目標", "")
@@ -267,14 +234,13 @@ project_assignment  = field_values.get("專案分工", "")
 
 st.write("---")
 
-
 # =============================================================================
-# 10. 提取專案名稱（給檔案命名用）— 完全保留原本邏輯
+# 10. 從 AI 產文擷取「專案名稱」做檔名（原樣保留）
 # =============================================================================
 def extract_project_title(text):
     patterns = [
-        r"一、專案名稱[^\n\r]*\n\s*[-＊*]\s*(.+)",   # markdown/列點
-        r"一、專案名稱[^\n\r]*\n\s*(.+)",            # 純文字
+        r"一、專案名稱[^\n\r]*\n\s*[-＊*]\s*(.+)",
+        r"一、專案名稱[^\n\r]*\n\s*(.+)",
     ]
     for pat in patterns:
         match = re.search(pat, text)
@@ -284,16 +250,14 @@ def extract_project_title(text):
             return title
     return None
 
-
 # =============================================================================
-# 11. session_state: AI內容不消失
+# 11. session_state
 # =============================================================================
 if "generated_text" not in st.session_state:
     st.session_state["generated_text"] = ""
 
-
 # =============================================================================
-# 12. 生成按鈕（AI生成&寫入session_state）— 保持原行為
+# 12. 生成按鈕
 # =============================================================================
 if st.button(f"🪄 生成 {doc_type}", use_container_width=True):
     if not selected_blocks:
@@ -311,7 +275,8 @@ if st.button(f"🪄 生成 {doc_type}", use_container_width=True):
                         project_benefit,
                         development_process,
                         timeline_schedule,
-                        project_assignment
+                        project_assignment,
+                        domain_hint_display
                     )
                 except Exception as e:
                     st.error(f"❌ 發生錯誤：{e}")
@@ -319,23 +284,28 @@ if st.button(f"🪄 生成 {doc_type}", use_container_width=True):
             if generated_text:
                 st.session_state["generated_text"] = generated_text
 
-
 # =============================================================================
-# 13. 顯示 AI 產生內容區（含 Copy 功能、下載）— 行為不變
+# 13. 顯示結果 + 下載（檔名＝AI 專案名稱；分頁規則不變）
 # =============================================================================
 if st.session_state.get("generated_text"):
     st.success(f"🎉 {doc_type} 生成完成！")
     st.markdown(f"### 📌 {doc_type} 預覽")
-    st.markdown(st.session_state["generated_text"])
-    st.code(st.session_state["generated_text"], language="markdown")
 
-    # Copy-to-clipboard 小提示（原樣保留）
+    content = st.session_state["generated_text"].strip()
+    st.markdown(content)
+    st.code(content, language="markdown")
+
     components.html("""
 <script>
 ;(function(){
+  // --- 壓掉 iframe 高度，避免留白 ---
+  try {
+    const f = window.frameElement;
+    if (f) { f.style.height='0'; f.style.border='0'; f.style.margin='0'; f.style.padding='0'; f.style.minHeight='0'; }
+  } catch(e){}
+
   const bind = ()=>{
-    const btn = window.parent.document
-                   .querySelector('button[title="Copy to clipboard"]');
+    const btn = window.parent.document.querySelector('button[title="Copy to clipboard"]');
     if(!btn||btn.dataset.bound) return;
     btn.dataset.bound = '1';
     const lbl = document.createElement('span');
@@ -349,7 +319,7 @@ if st.session_state.get("generated_text"):
 })();
 </script>""", height=0)
 
-    # 取專案名稱作為檔案名（保留原本嚴格條件）
+    # 取專案名稱作為檔名（保留原本嚴格條件）
     filename_base = extract_project_title(st.session_state["generated_text"])
     if not filename_base:
         st.error("❌ 無法擷取『專案名稱』（請確認AI回應有『一、專案名稱』區塊），無法下載檔案")
@@ -357,11 +327,11 @@ if st.session_state.get("generated_text"):
         filename_base = re.sub(r'[\\/:*?"<>|]', '_', filename_base)
         generated_text = st.session_state["generated_text"]
 
-        # --- 產生 PPTX 下載（原邏輯：以 Markdown # 作為分頁標題） ---
+        # --- 產生 PPTX 下載（以 Markdown # 作為分頁標題） ---
         try:
             ppt = Presentation()
 
-            # 首頁大標題
+            # 首頁
             title_slide_layout = ppt.slide_layouts[0]
             slide = ppt.slides.add_slide(title_slide_layout)
             slide.shapes.title.text = filename_base
@@ -374,36 +344,33 @@ if st.session_state.get("generated_text"):
             title_shape.text_frame.paragraphs[0].font.bold = True
             title_shape.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
 
-            # 仍依原本邏輯：只用 Markdown 標題分段
             headers = list(re.finditer(r'^(#+)\s*(.+)', generated_text, re.M))
 
             def add_slide(title, content):
                 slide = ppt.slides.add_slide(ppt.slide_layouts[1])
 
-                # 標題
                 tf = slide.shapes.title.text_frame
                 tf.clear()
-                tf.margin_top      = Pt(5)
+                tf.margin_top = Pt(5)
                 tf.vertical_anchor = MSO_ANCHOR.TOP
-                p  = tf.paragraphs[0]
-                p.text              = title
-                p.font.name         = '微軟正黑體'
-                p.font.size         = Pt(32)
-                p.font.color.rgb    = RGBColor(0,108,184)
-                p.alignment         = PP_ALIGN.LEFT
+                p = tf.paragraphs[0]
+                p.text = title
+                p.font.name = '微軟正黑體'
+                p.font.size = Pt(32)
+                p.font.color.rgb = RGBColor(0,108,184)
+                p.alignment = PP_ALIGN.LEFT
 
-                # 內文
                 body = slide.placeholders[1].text_frame
                 body.clear()
-                body.margin_top      = Pt(5)
+                body.margin_top = Pt(5)
                 body.vertical_anchor = MSO_ANCHOR.TOP
                 for line in content.split('\n'):
                     para = body.add_paragraph()
-                    para.text           = line
-                    para.font.name      = '微軟正黑體'
-                    para.font.size      = Pt(24)
+                    para.text = line
+                    para.font.name = '微軟正黑體'
+                    para.font.size = Pt(24)
                     para.font.color.rgb = RGBColor(0,0,0)
-                    para.alignment      = PP_ALIGN.LEFT
+                    para.alignment = PP_ALIGN.LEFT
                 try:
                     body.fit_text(max_size=24)
                 except Exception:
@@ -430,7 +397,7 @@ if st.session_state.get("generated_text"):
         except ImportError:
             st.error("❌ 無法匯出 PPTX，請 pip install python-pptx")
 
-        # --- 產生 DOCX 下載（原邏輯：同樣依 Markdown 標題） ---
+        # --- 產生 DOCX 下載 ---
         try:
             from docx import Document
             from docx.shared import Pt as DocPt
