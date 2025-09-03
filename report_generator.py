@@ -72,7 +72,7 @@ if not api_key:
 # 3. Streamlit 頁面設定
 # =============================================================================
 st.set_page_config(
-    page_title="Gemini 文件產生器",
+    page_title="AI 需求與結案報告產生器",
     page_icon="✨",
     layout="wide"
 )
@@ -157,7 +157,7 @@ creativity_temp = st.sidebar.slider("", 0.0, 1.0, 0.5, 0.1)
 # =============================================================================
 st.markdown(f"""
 <div class="header">
-  <div class="big-title">🚀 Gemini {doc_type} 產生器</div>
+  <div class="big-title">🚀 AI {doc_type} 產生器</div>
   <div class="subtitle">只要簡單輸入口語化內容，AI 幫你生成專業 {doc_type}！</div>
 </div>
 """, unsafe_allow_html=True)
